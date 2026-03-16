@@ -3,11 +3,12 @@ import cv2
 import numpy as np
 import time
 from scipy.spatial import distance
-import sys
 import matplotlib.pyplot as plt
 from xarm.wrapper import XArmAPI
 import time
-from datetime import datetime, date
+from datetime import datetime
+from rembg import remove
+from pathlib import Path
 
 class PathPlanner:
     def __init__(self, image_path, canvas_width_mm=200):
@@ -23,13 +24,16 @@ class PathPlanner:
         if save:
             # Create an 'output' folder if it doesn't exist
             os.makedirs("output", exist_ok=True)
-            
-            # Strip special characters from the title to make a safe filename
-            safe_title = "".join([c for c in title if c.isalnum() or c == ' ']).rstrip()
 
-            now = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
-            filename = f"output/{safe_title.replace(' ', '_').lower() + ' ' + now}.png"
+            # Strip special characters from the title to make a safe filename
+            safe_title = "".join(
+                [c for c in title if c.isalnum() or c == ' ']).rstrip()
             
+            image_file_name = Path(self.image_path).name
+            
+            now = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+            filename = f"output/{image_file_name} {safe_title.replace(' ', '_').lower() + ' ' + now}.png"
+
             # Save the raw image array cleanly using OpenCV
             cv2.imwrite(filename, img)
             print(f"[*] Saved debug image: {filename}")
@@ -43,16 +47,22 @@ class PathPlanner:
         else:
             plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         plt.axis('off')
-        plt.show() # Code pauses here until window is closed
+        plt.show()  # Code pauses here until window is closed
 
-    def process_portrait(self, method="canny"):
+    def process_portrait(self):
         """
         Optimized for Faces and Fine Details with Visual Debugging.
         """
         # 1. Load Image
-        img = cv2.imread(self.image_path, cv2.IMREAD_GRAYSCALE)
-        if img is None:
+        img_color = cv2.imread(self.image_path)
+        if img_color is None:
             raise ValueError("Image not found")
+
+        # 2. Remove Background
+        # rembg takes a numpy array and returns a numpy array (BGRA format)
+        img_nobg = remove(img_color)
+
+        img = cv2.cvtColor(img_nobg, cv2.COLOR_BGRA2GRAY)
 
         # 2. Resize maintaining aspect ratio
         h, w = img.shape
@@ -60,17 +70,10 @@ class PathPlanner:
         aspect_ratio = h / w
         new_h = int(new_w * aspect_ratio)
         img = cv2.resize(img, (new_w, new_h))
-        
-        # --- DEBUG SHOW ---
-        self.display_step(img, "1. Resized Image")
 
-        # 3. Pre-processing: CLAHE
-        # clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        # img = clahe.apply(img)
-        # 4. Noise Reduction
-        # img = cv2.GaussianBlur(img, (5, 5), 0)
-        # # --- DEBUG SHOW ---
-        # self.display_step(img, "3. Gaussian Blur (Noise Reduction)")
+        # --- DEBUG SHOW ---
+        self.display_step(img, "1. Resized Image, removed background", save=True)
+
         clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
         img = clahe.apply(img)
 
@@ -78,73 +81,70 @@ class PathPlanner:
         # --- DEBUG SHOW ---
         self.display_step(img, "3. Bilateral Filter (Smoothed Skin)")
 
-
-
         binary_output = None
 
-        if method == "canny":
-            # --- METHOD A: Canny Edge Detection ---
-            v = np.median(img)
-            lower_threshold = 20   # Increase this if you still have too much noise
-            upper_threshold = 60  # Increase this if you still have too much noise
-            
-            edges = cv2.Canny(img, lower_threshold, upper_threshold)
-#             If the nose/mouth are STILL missing: Lower the upper_threshold to 50 or 40.
 
-# If the messy skin pores/shirt texture come back: Raise the upper_threshold back up slightly (e.g., 70 or 80), or increase the Bilateral Filter sigmaColor to 50.
+        # --- METHOD A: Canny Edge Detection ---
+        lower_threshold = 20   # Increase this if you still have too much noise
+        upper_threshold = 60  # Increase this if you still have too much noise
 
-# If the lines of the mouth are broken and dotted: Lower the lower_threshold to 10. This acts like a magnet, helping loose lines connect to stronger lines.
-            # --- DEBUG SHOW ---
-            self.display_step(edges, "4a. Raw Canny Edges (1px wide)", save=True)
-            
-            # Dilate to connect broken lines
-            # kernel = np.ones((2,2), np.uint8)
-            # dilated = cv2.dilate(edges, kernel, iterations=1)
-            # binary_output = dilated
+        edges = cv2.Canny(img, lower_threshold, upper_threshold)
+        # If the nose/mouth are STILL missing: Lower the upper_threshold to 50 or 40.
 
-            dilated = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1) # Connect gaps first
-            binary_output = cv2.ximgproc.thinning(dilated)
-            # --- DEBUG SHOW ---
-            self.display_step(binary_output, "4b. Dilated (Thickened Lines)", save=True)
-            
-            
+        # If the messy skin pores/shirt texture come back: Raise the upper_threshold back up slightly (e.g., 70 or 80), or increase the Bilateral Filter sigmaColor to 50.
 
-        elif method == "sketch":
-            # --- METHOD B: Adaptive Thresholding ---
-            binary_output = cv2.adaptiveThreshold(
-                img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                cv2.THRESH_BINARY_INV, 15, 3
-            )
-            
-            # --- DEBUG SHOW ---
-            self.display_step(binary_output, "4. Adaptive Threshold Sketch", save=True)
+        # If the lines of the mouth are broken and dotted: Lower the lower_threshold to 10. This acts like a magnet, helping loose lines connect to stronger lines.
+        # --- DEBUG SHOW ---
+        self.display_step(
+            edges, "4a. Raw Canny Edges (1px wide)", save=True)
+
+        dilated = cv2.dilate(edges, np.ones(
+            (3, 3), np.uint8), iterations=1)  # Connect gaps first
+        binary_output = cv2.ximgproc.thinning(dilated)
+        # --- DEBUG SHOW ---
+        self.display_step(
+            binary_output, "4b. Dilated (Thickened Lines)", save=True)
+
+
 
         # 5. Extract Contours
         contours, hierarchy = cv2.findContours(
             binary_output, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         # 6. Filter Noise and Approximate
-        min_path_length = 15 
+        min_path_length = 15
         paths = []
-        
+
         # Visualizing contours requires drawing them on a blank canvas
         debug_contours_canvas = np.zeros_like(img)
-        
+
         for cnt in contours:
             if cv2.arcLength(cnt, False) > min_path_length:
                 # Approximate
                 epsilon = 0.002 * cv2.arcLength(cnt, True)
                 approx = cv2.approxPolyDP(cnt, epsilon, False)
                 paths.append(approx.reshape(-1, 2))
-                
+
                 # Draw for debug
                 cv2.drawContours(debug_contours_canvas, [approx], -1, 255, 1)
 
         # --- DEBUG SHOW ---
-        self.display_step(debug_contours_canvas, "5. Final Contours (Robot Path)", save=True)
+        self.display_step(debug_contours_canvas,
+                          "5. Final Contours (Robot Path)", save=True)
 
         self.scale_factor = self.target_width / new_w
         print(f"Details extracted. Found {len(paths)} paths.")
+        
+
+        # Logging
+        image_file_name = Path(self.image_path).name
+        os.makedirs("output", exist_ok=True)
+        filename = "log.txt"
+        with open(f"{os.getcwd()}/output/{filename}", "a") as f:
+            f.write(
+                f"{image_file_name} : Found {len(paths)} paths.\n"
+            )
+
         return paths
 
     def optimize_paths(self, paths):
@@ -163,7 +163,7 @@ class PathPlanner:
         remaining = [p.astype(float) for p in remaining]
 
         print("Optimizing path order (this calculates travel distance)...")
-        
+
         while remaining:
             # Get start and end points of all remaining paths
             starts = np.array([p[0] for p in remaining])
@@ -185,7 +185,7 @@ class PathPlanner:
             else:
                 best_idx = min_end_idx
                 path_to_add = remaining.pop(best_idx)
-                path_to_add = path_to_add[::-1] # Reverse path
+                path_to_add = path_to_add[::-1]  # Reverse path
 
             ordered.append(path_to_add)
             current_pos = path_to_add[-1]
@@ -204,8 +204,9 @@ class PathPlanner:
                 pt = point * self.scale_factor
                 yield (1, pt[0], pt[1])
 
+
 class XArmArtist:
-    def __init__(self, ip_address, speed=100, acceleration=2000, z_draw=0, z_travel=20, grip_width = 270):
+    def __init__(self, ip_address, speed=100, acceleration=2000, z_draw=0, z_travel=20, grip_width=270):
         self.arm = XArmAPI(ip_address)
         self.z_draw = z_draw
         self.z_travel = z_travel
@@ -227,11 +228,13 @@ class XArmArtist:
 
     def put_pen_in(self):
         # Rotates wrist to side to make inserting pen easier
-        self.arm.set_servo_angle(servo_id=5, angle=90, is_radian=False, wait=True)
+        self.arm.set_servo_angle(servo_id=5, angle=90,
+                                 is_radian=False, wait=True)
         self.arm.set_gripper_position(self.grip_width+50, wait=True)
         print(">>> PLEASE INSERT PEN NOW. You have 10 seconds. <<<")
         time.sleep(10)
-        self.arm.set_gripper_position(self.grip_width-30, wait=True) # Grip tight
+        self.arm.set_gripper_position(
+            self.grip_width-30, wait=True)  # Grip tight
         time.sleep(1)
 
     def draw(self, data_stream, origin_offset_x, origin_offset_y):
@@ -239,7 +242,7 @@ class XArmArtist:
         print("Starting drawing...")
 
         current_state = 0  # 0 = Up, 1 = Down
-        
+
         # Batch optimization could go here, but point-by-point is safer for beginners
         for cmd_type, x, y in data_stream:
             target_x = origin_offset_x + x
@@ -247,62 +250,93 @@ class XArmArtist:
 
             if cmd_type == 0:  # TRAVEL (Pen Up)
                 if current_state == 1:
-                    self.arm.set_position(z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
+                    self.arm.set_position(
+                        z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
                     current_state = 0
-                self.arm.set_position(x=target_x, y=target_y, z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
+                self.arm.set_position(
+                    x=target_x, y=target_y, z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
 
             elif cmd_type == 1:  # DRAW (Pen Down)
                 if current_state == 0:
-                    self.arm.set_position(z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=True)
+                    self.arm.set_position(
+                        z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=True)
                     current_state = 1
                 # wait=False allows continuous motion (smoother curves)
-                self.arm.set_position(x=target_x, y=target_y, z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=False)
+                self.arm.set_position(
+                    x=target_x, y=target_y, z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=False)
 
         # Lift at end
-        self.arm.set_position(z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
+        self.arm.set_position(
+            z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
         self.go_home()
         self.arm.disconnect()
         print("Drawing complete.")
 
-if __name__ == "__main__":
-    # --- CONFIGURATION ---
-    IMAGE_FILE = "./test_img/myself_rmv.jpg" 
-    ROBOT_IP = "192.168.1.227"
-    SIMULATION_MODE = True  # Set False to draw on real robot
 
-    # PROCESS MODE: 'canny' (best for outlines/faces) or 'sketch' (messy shading)
-    DRAWING_STYLE = "canny" 
 
-    # ROBOT OFFSET
-    ROBOT_ORIGIN_X = 250
-    ROBOT_ORIGIN_Y = -100
-    DRAW_WIDTH_MM = 150
-    
-    # CALIBRATION
-    GRIPPER_DEPTH = 74.4
-    PEN_LENGTH = 127.4 + 1.0
-    PEN_DOWN_Z = PEN_LENGTH - GRIPPER_DEPTH
-    PEN_UP_Z = PEN_DOWN_Z + 15
+class RemoteController:
+    """
+    A wrapper class for the configurations to run the XArmArtist and the image processing
+    """
+    def __init__(self, image_file=None):
+        self.ROBOT_IP = "192.168.1.227"
 
-    planner = PathPlanner(IMAGE_FILE, canvas_width_mm=DRAW_WIDTH_MM)
-    
-    try:
-        # USE THE NEW PORTRAIT METHOD
-        raw_paths = planner.process_portrait(method=DRAWING_STYLE)
-        planner.optimize_paths(raw_paths)
-    except Exception as e:
-        print(f"Error: {e}")
-        exit()
+        self.ROBOT_ORIGIN_X = 250
+        self.ROBOT_ORIGIN_Y = -100
+        self.DRAW_WIDTH_MM = 150
 
-    stream = planner.stream_data()
+        self.GRIPPER_DEPTH = 74.4
+        self.PEN_LENGTH = 128.4
+        self.PEN_DOWN_Z = self.PEN_LENGTH - self.GRIPPER_DEPTH
+        self.PEN_UP_Z = self.PEN_DOWN_Z + 15
 
-    if SIMULATION_MODE:
+        self.IMAGE_FILE = None
+        self.pathplanner = None
+        self.stream = None
+
+        # Process an initial image if provided
+        if image_file:
+            self.load_image(image_file)
+
+    def load_image(self, image_file):
+        """Processes a new image and updates the drawing paths."""
+        self.IMAGE_FILE = image_file
+        self.pathplanner = PathPlanner(self.IMAGE_FILE, canvas_width_mm=self.DRAW_WIDTH_MM)
+        
+        try:
+            print(f"Processing image: {self.IMAGE_FILE}...")
+            raw_paths = self.pathplanner.process_portrait()
+            self.pathplanner.optimize_paths(raw_paths)
+            
+            # Note: converting the generator to a list so it can be reused
+            # for both simulation and real robot drawing without needing to re-process!
+            self.stream = list(self.pathplanner.stream_data())
+            print("Image processing complete and paths saved.")
+        except Exception as e:
+            print(f"Error processing image: {e}")
+            self.stream = None
+
+    def change_robot_config(self, **kwargs):
+        self.ROBOT_ORIGIN_X = kwargs.get("ROBOT_ORIGIN_X", self.ROBOT_ORIGIN_X)
+        self.ROBOT_ORIGIN_Y = kwargs.get("ROBOT_ORIGIN_Y", self.ROBOT_ORIGIN_Y)
+        self.DRAW_WIDTH_MM = kwargs.get("DRAW_WIDTH_MM", self.DRAW_WIDTH_MM)
+
+        self.GRIPPER_DEPTH = kwargs.get("GRIPPER_DEPTH", self.GRIPPER_DEPTH)
+        self.PEN_LENGTH = kwargs.get("PEN_LENGTH", self.PEN_LENGTH)
+        self.PEN_DOWN_Z = self.PEN_LENGTH - self.GRIPPER_DEPTH
+        self.PEN_UP_Z = self.PEN_DOWN_Z + 15
+
+    def run_simulation(self):
+        if not self.stream:
+            print("No drawing data available. Please load a valid image first.")
+            return
+
         print("Running Simulation...")
         ink_x, ink_y = [], []
-        travel_x, travel_y = [], []
+        travel_x, travel_y = [],[]
         last_x, last_y = 0, 0
-        
-        for cmd, x, y in stream:
+
+        for cmd, x, y in self.stream:
             if cmd == 0:
                 travel_x.extend([last_x, x, np.nan])
                 travel_y.extend([last_y, y, np.nan])
@@ -314,22 +348,64 @@ if __name__ == "__main__":
             last_x, last_y = x, y
 
         plt.figure(figsize=(10, 10))
-        plt.title(f"Simulation: {DRAWING_STYLE.upper()} Mode")
+        plt.title(f"Simulation: {self.IMAGE_FILE}")
         plt.plot(travel_x, travel_y, 'r:', linewidth=0.3, alpha=0.3)
-        plt.plot(ink_x, ink_y, 'k-', linewidth=0.8) # Black ink
+        plt.plot(ink_x, ink_y, 'k-', linewidth=0.8)  # Black ink
         plt.axis('equal')
         plt.gca().invert_yaxis()
         plt.show()
 
-    else:
+    def run_robot_drawing(self):
+        if not self.stream:
+            print("No drawing data available. Please load a valid image first.")
+            return
+
         print("Running on Real xArm...")
-        import time 
+        import time
 
         start = time.time()
-        bot = XArmArtist(ROBOT_IP, speed=300, acceleration=1000, 
-                         z_draw=PEN_DOWN_Z, z_travel=PEN_UP_Z, grip_width=270)
+        bot = XArmArtist(self.ROBOT_IP, speed=300, acceleration=1000,
+                         z_draw=self.PEN_DOWN_Z, z_travel=self.PEN_UP_Z, grip_width=270)
         bot.connect()
         bot.put_pen_in()
-        bot.draw(stream, ROBOT_ORIGIN_X, ROBOT_ORIGIN_Y)
+        bot.draw(self.stream, self.ROBOT_ORIGIN_X, self.ROBOT_ORIGIN_Y)
         print("Time Taken:")
         print(time.time() - start)
+
+
+if __name__ == "__main__":
+    # Initialize the controller without enforcing an image path immediately
+    remote = RemoteController()
+
+    while True:
+        print("\n=== xArm Artist Control Menu ===")
+        print("1. Load new image")
+        print("2. Run simulation")
+        print("3. Run robot drawing")
+        print("4. Exit")
+        
+        choice = input("Select an option (1-4): ").strip()
+        
+        if choice == '1':
+            img_path = input("Enter the file path for the image: ").strip()
+            # If the path is wrapped in quotes from drag-and-drop, strip them
+            img_path = img_path.strip('\'"')
+            remote.load_image(img_path)
+            
+        elif choice == '2':
+            remote.run_simulation()
+            
+        elif choice == '3':
+            # WARNING: Make sure the area is clear!
+            confirm = input("Are you sure you want to send this to the real robot? (y/n): ").lower()
+            if confirm == 'y':
+                remote.run_robot_drawing()
+            else:
+                print("Robot run cancelled.")
+                
+        elif choice == '4':
+            print("Exiting...")
+            break
+            
+        else:
+            print("Invalid choice. Please select 1, 2, 3, or 4.")
