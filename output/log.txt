@@ -1,3 +1,7 @@
 man : Found 223 paths.
 myself : Found 450 paths.
 old : Found 786 paths.
+blackwoman : Found 821 paths.
+baldman : Found 1032 paths.
+baldman.jpg : Found 1032 paths.
+myself.jpg : Found 450 paths.

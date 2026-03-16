@@ -106,27 +106,33 @@ class PathPlanner:
             binary_output, "4b. Dilated (Thickened Lines)", save=True)
 
 
-
-        # 5. Extract Contours
         contours, hierarchy = cv2.findContours(
             binary_output, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         # 6. Filter Noise and Approximate
         min_path_length = 15
-        paths = []
+        paths =[]
 
         # Visualizing contours requires drawing them on a blank canvas
         debug_contours_canvas = np.zeros_like(img)
 
         for cnt in contours:
-            if cv2.arcLength(cnt, False) > min_path_length:
-                # Approximate
-                epsilon = 0.002 * cv2.arcLength(cnt, True)
-                approx = cv2.approxPolyDP(cnt, epsilon, False)
-                paths.append(approx.reshape(-1, 2))
+            # Check length of the path (closed=False because these are line paths)
+            if cv2.arcLength(cnt, closed=False) > min_path_length:
+                
+                # FIX 1: Use a small, fixed pixel distance for epsilon (e.g. 1.0 to 2.0).
+                # This ensures fine details are kept, regardless of how long the contour is.
+                epsilon = 1.0  
+                approx = cv2.approxPolyDP(cnt, epsilon, closed=False)
+                
+                # Make sure the approximation didn't destroy the path entirely
+                if len(approx) > 1:
+                    paths.append(approx.reshape(-1, 2))
 
-                # Draw for debug
-                cv2.drawContours(debug_contours_canvas, [approx], -1, 255, 1)
+                    # FIX 2: Use cv2.polylines instead of cv2.drawContours!
+                    # This draws the exact path the robot will take without artificially
+                    # closing the gap between the start and end points.
+                    cv2.polylines(debug_contours_canvas, [approx], isClosed=False, color=255, thickness=1)
 
         # --- DEBUG SHOW ---
         self.display_step(debug_contours_canvas,
