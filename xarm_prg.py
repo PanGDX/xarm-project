@@ -7,6 +7,7 @@ import sys
 import matplotlib.pyplot as plt
 from xarm.wrapper import XArmAPI
 import time
+from datetime import datetime, date
 
 class PathPlanner:
     def __init__(self, image_path, canvas_width_mm=200):
@@ -16,8 +17,24 @@ class PathPlanner:
         self.origin_offset = (0, 0)
         self.ordered_paths = []
 
-    def display_step(self, img, title="Debug Step"):
-        """Helper to visualize image processing steps using Matplotlib"""
+    def display_step(self, img, title="Debug Step", save=False):
+        """Helper to visualize image processing steps using Matplotlib and optionally save them."""
+        # --- NEW SAVING LOGIC ---
+        if save:
+            # Create an 'output' folder if it doesn't exist
+            os.makedirs("output", exist_ok=True)
+            
+            # Strip special characters from the title to make a safe filename
+            safe_title = "".join([c for c in title if c.isalnum() or c == ' ']).rstrip()
+
+            now = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+            filename = f"output/{safe_title.replace(' ', '_').lower() + ' ' + now}.png"
+            
+            # Save the raw image array cleanly using OpenCV
+            cv2.imwrite(filename, img)
+            print(f"[*] Saved debug image: {filename}")
+
+        # --- EXISTING DISPLAY LOGIC ---
         plt.figure(figsize=(10, 8))
         plt.title(title)
         # Check if image is grayscale or color
@@ -78,7 +95,7 @@ class PathPlanner:
 
 # If the lines of the mouth are broken and dotted: Lower the lower_threshold to 10. This acts like a magnet, helping loose lines connect to stronger lines.
             # --- DEBUG SHOW ---
-            self.display_step(edges, "4a. Raw Canny Edges (1px wide)")
+            self.display_step(edges, "4a. Raw Canny Edges (1px wide)", save=True)
             
             # Dilate to connect broken lines
             # kernel = np.ones((2,2), np.uint8)
@@ -88,7 +105,7 @@ class PathPlanner:
             dilated = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1) # Connect gaps first
             binary_output = cv2.ximgproc.thinning(dilated)
             # --- DEBUG SHOW ---
-            self.display_step(binary_output, "4b. Dilated (Thickened Lines)")
+            self.display_step(binary_output, "4b. Dilated (Thickened Lines)", save=True)
             
             
 
@@ -100,7 +117,7 @@ class PathPlanner:
             )
             
             # --- DEBUG SHOW ---
-            self.display_step(binary_output, "4. Adaptive Threshold Sketch")
+            self.display_step(binary_output, "4. Adaptive Threshold Sketch", save=True)
 
         # 5. Extract Contours
         contours, hierarchy = cv2.findContours(
@@ -124,7 +141,7 @@ class PathPlanner:
                 cv2.drawContours(debug_contours_canvas, [approx], -1, 255, 1)
 
         # --- DEBUG SHOW ---
-        self.display_step(debug_contours_canvas, "5. Final Contours (Robot Path)")
+        self.display_step(debug_contours_canvas, "5. Final Contours (Robot Path)", save=True)
 
         self.scale_factor = self.target_width / new_w
         print(f"Details extracted. Found {len(paths)} paths.")
