@@ -9,6 +9,34 @@ import time
 from datetime import datetime
 from rembg import remove
 from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog
+
+def select_file_via_explorer():
+    """
+    Opens a standard Windows file explorer dialog to select an image file.
+    Works perfectly for USB drives or phones connected via USB (MTP).
+    """
+    # Create a dummy Tkinter root window and hide it
+    root = tk.Tk()
+    root.withdraw()
+    
+    # Force the window to appear on top
+    root.attributes('-topmost', True)
+
+    print("Opening file explorer...")
+    file_path = filedialog.askopenfilename(
+        title="Select an Image from USB/Phone",
+        filetypes=[
+            ("Image Files", "*.png *.jpg *.jpeg *.bmp"),
+            ("All Files", "*.*")
+        ]
+    )
+    
+    # Destroy the dummy window after selection
+    root.destroy()
+    
+    return file_path
 
 class PathPlanner:
     def __init__(self, image_path, canvas_width_mm=200):
@@ -380,21 +408,28 @@ class RemoteController:
 
 
 if __name__ == "__main__":
-    # Initialize the controller without enforcing an image path immediately
     remote = RemoteController()
 
     while True:
         print("\n=== xArm Artist Control Menu ===")
-        print("1. Load new image")
+        print("0. Select image via File Explorer (USB/Phone)")
+        print("1. Load new image (Enter path manually)")
         print("2. Run simulation")
         print("3. Run robot drawing")
         print("4. Exit")
         
-        choice = input("Select an option (1-4): ").strip()
+        choice = input("Select an option (0-4): ").strip()
         
-        if choice == '1':
+        if choice == '0':
+            received_path = select_file_via_explorer()
+            if received_path:
+                print(f"Selected file: {received_path}")
+                remote.load_image(received_path)
+            else:
+                print("No file selected.")
+            
+        elif choice == '1':
             img_path = input("Enter the file path for the image: ").strip()
-            # If the path is wrapped in quotes from drag-and-drop, strip them
             img_path = img_path.strip('\'"')
             remote.load_image(img_path)
             
@@ -402,7 +437,6 @@ if __name__ == "__main__":
             remote.run_simulation()
             
         elif choice == '3':
-            # WARNING: Make sure the area is clear!
             confirm = input("Are you sure you want to send this to the real robot? (y/n): ").lower()
             if confirm == 'y':
                 remote.run_robot_drawing()
@@ -414,4 +448,4 @@ if __name__ == "__main__":
             break
             
         else:
-            print("Invalid choice. Please select 1, 2, 3, or 4.")
+            print("Invalid choice. Please select 0, 1, 2, 3, or 4.")
