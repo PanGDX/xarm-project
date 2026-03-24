@@ -5,12 +5,12 @@ import time
 from scipy.spatial import distance
 import matplotlib.pyplot as plt
 from xarm.wrapper import XArmAPI
-import time
 from datetime import datetime
 from rembg import remove
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog
+from collections import defaultdict
 
 def select_file_via_explorer():
     """
@@ -39,12 +39,12 @@ def select_file_via_explorer():
     return file_path
 
 class PathPlanner:
-    def __init__(self, image_path, canvas_width_mm=200):
+    def __init__(self, image_path, canvas_width_mm=400):
         self.image_path = image_path
         self.target_width = canvas_width_mm
         self.scale_factor = 1.0
         self.origin_offset = (0, 0)
-        self.ordered_paths = []
+        self.ordered_paths =[]
 
     def display_step(self, img, title="Debug Step", save=False):
         """Helper to visualize image processing steps using Matplotlib and optionally save them."""
@@ -54,8 +54,7 @@ class PathPlanner:
             os.makedirs("output", exist_ok=True)
 
             # Strip special characters from the title to make a safe filename
-            safe_title = "".join(
-                [c for c in title if c.isalnum() or c == ' ']).rstrip()
+            safe_title = "".join([c for c in title if c.isalnum() or c == ' ']).rstrip()
             
             image_file_name = Path(self.image_path).name
             
@@ -111,17 +110,12 @@ class PathPlanner:
 
         binary_output = None
 
-
         # --- METHOD A: Canny Edge Detection ---
-        lower_threshold = 20   # Increase this if you still have too much noise
-        upper_threshold = 60  # Increase this if you still have too much noise
+        lower_threshold = 20   
+        upper_threshold = 60  
 
         edges = cv2.Canny(img, lower_threshold, upper_threshold)
-        # If the nose/mouth are STILL missing: Lower the upper_threshold to 50 or 40.
 
-        # If the messy skin pores/shirt texture come back: Raise the upper_threshold back up slightly (e.g., 70 or 80), or increase the Bilateral Filter sigmaColor to 50.
-
-        # If the lines of the mouth are broken and dotted: Lower the lower_threshold to 10. This acts like a magnet, helping loose lines connect to stronger lines.
         # --- DEBUG SHOW ---
         self.display_step(
             edges, "4a. Raw Canny Edges (1px wide)", save=True)
@@ -134,42 +128,103 @@ class PathPlanner:
             binary_output, "4b. Dilated (Thickened Lines)", save=True)
 
 
-        contours, hierarchy = cv2.findContours(
-            binary_output, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        # =====================================================================
+        # NEW METHOD: Connected Component Analysis + Depth First Search
+        # =====================================================================
+        
+        # 1. Get 8-connectivity components and their stats
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_output, connectivity=8)
+        areas = stats[:, cv2.CC_STAT_AREA]
+        
+        # 2. Sort components by area (biggest to smallest), ignoring background (label 0)
+        label_area_pairs = [(label, areas[label]) for label in range(1, num_labels)]
+        label_area_pairs.sort(key=lambda x: x[1], reverse=True)
+        
+        # 3. Group pixels by label for fast access
+        y_coords, x_coords = np.nonzero(labels)
+        label_vals = labels[y_coords, x_coords]
+        
+        component_pixels_dict = defaultdict(set)
+        for y, x, lbl in zip(y_coords, x_coords, label_vals):
+            component_pixels_dict[lbl].add((y, x))
 
-        # 6. Filter Noise and Approximate
-        min_path_length = 15
+        min_path_length = 15 # Reject components with less than 15 pixels
         paths =[]
-
-        # Visualizing contours requires drawing them on a blank canvas
         debug_contours_canvas = np.zeros_like(img)
 
-        for cnt in contours:
-            # Check length of the path (closed=False because these are line paths)
-            if cv2.arcLength(cnt, closed=False) > min_path_length:
-                
-                # FIX 1: Use a small, fixed pixel distance for epsilon (e.g. 1.0 to 2.0).
-                # This ensures fine details are kept, regardless of how long the contour is.
-                epsilon = 1.0  
-                approx = cv2.approxPolyDP(cnt, epsilon, closed=False)
-                
-                # Make sure the approximation didn't destroy the path entirely
-                if len(approx) > 1:
-                    paths.append(approx.reshape(-1, 2))
+        print(f"Found {num_labels - 1} connected components. Running DFS to generate paths...")
 
-                    # FIX 2: Use cv2.polylines instead of cv2.drawContours!
-                    # This draws the exact path the robot will take without artificially
-                    # closing the gap between the start and end points.
-                    cv2.polylines(debug_contours_canvas, [approx], isClosed=False, color=255, thickness=1)
+        # 4. Iterate over sorted components
+        for label, area in label_area_pairs:
+            if area < min_path_length:
+                continue
+                
+            component_pixels = component_pixels_dict[label]
+            
+            # Find a good starting node (an endpoint with exactly 1 neighbor if possible)
+            start_node = None
+            for node in component_pixels:
+                r, c = node
+                neighbors =[(r-1, c-1), (r-1, c), (r-1, c+1), 
+                             (r, c-1),             (r, c+1), 
+                             (r+1, c-1), (r+1, c), (r+1, c+1)]
+                count = sum(1 for n in neighbors if n in component_pixels)
+                if count == 1:
+                    start_node = node
+                    break
+            
+            if start_node is None:
+                # No endpoint found (e.g. a closed loop), just pick any node
+                start_node = next(iter(component_pixels))
+                
+            # Iterative DFS with Backtracking to generate a single continuous path
+            stack = [start_node]
+            visited = {start_node}
+            path =[]
+            
+            while stack:
+                curr = stack[-1]
+                # Add to path if it's the first node, or if we moved to a new node/backtracked
+                if not path or path[-1] != curr:
+                    path.append(curr)
+                    
+                r, c = curr
+                neighbors =[(r-1, c-1), (r-1, c), (r-1, c+1), 
+                             (r, c-1),             (r, c+1), 
+                             (r+1, c-1), (r+1, c), (r+1, c+1)]
+                             
+                # Find valid unvisited neighbors
+                unvisited_neighbors =[n for n in neighbors if n in component_pixels and n not in visited]
+                
+                if unvisited_neighbors:
+                    next_node = unvisited_neighbors[0] # Pick the first available
+                    visited.add(next_node)
+                    stack.append(next_node)
+                else:
+                    stack.pop() # Dead end, remove from stack
+                    if stack:
+                        # Emulate physical backtracking (draw back over the line)
+                        path.append(stack[-1]) 
+                        
+            # 5. Convert path to (x, y) coordinates
+            path_xy = np.array([(c, r) for r, c in path], dtype=np.float32)
+            
+            # 6. Approximate path to reduce unnecessary points (G-code optimization)
+            epsilon = 1.0
+            approx = cv2.approxPolyDP(path_xy, epsilon, closed=False)
+            
+            if len(approx) > 1:
+                final_path = approx.reshape(-1, 2)
+                paths.append(final_path)
+                cv2.polylines(debug_contours_canvas, [np.int32(final_path)], isClosed=False, color=255, thickness=1)
 
         # --- DEBUG SHOW ---
         self.display_step(debug_contours_canvas,
-                          "5. Final Contours (Robot Path)", save=True)
+                          "5. Final DFS Paths (Robot Path)", save=True)
 
         self.scale_factor = self.target_width / new_w
         print(f"Details extracted. Found {len(paths)} paths.")
         
-
         # Logging
         image_file_name = Path(self.image_path).name
         os.makedirs("output", exist_ok=True)
@@ -183,49 +238,18 @@ class PathPlanner:
 
     def optimize_paths(self, paths):
         """
-        Greedy Algorithm (Nearest Neighbor) to minimize pen lifts.
+        Replaced the nearest neighbor pathing algorithm.
+        CCA already guarantees the order from Biggest to Smallest.
         """
         if not paths:
-            return []
+            return[]
 
-        # Start at 0,0
-        current_pos = np.array([0, 0])
-        ordered = []
-        remaining = paths.copy()
+        print("Using size-ordered paths from Connected Components (Biggest to Smallest)...")
+        
+        # Pre-convert all paths to float arrays to avoid type errors during streaming
+        self.ordered_paths = [p.astype(float) for p in paths]
 
-        # Pre-convert all paths to float arrays to avoid type errors during distance calc
-        remaining = [p.astype(float) for p in remaining]
-
-        print("Optimizing path order (this calculates travel distance)...")
-
-        while remaining:
-            # Get start and end points of all remaining paths
-            starts = np.array([p[0] for p in remaining])
-            ends = np.array([p[-1] for p in remaining])
-
-            # Calculate distances from current position
-            dist_to_starts = distance.cdist([current_pos], starts)[0]
-            dist_to_ends = distance.cdist([current_pos], ends)[0]
-
-            min_start_idx = np.argmin(dist_to_starts)
-            min_end_idx = np.argmin(dist_to_ends)
-
-            min_start_dist = dist_to_starts[min_start_idx]
-            min_end_dist = dist_to_ends[min_end_idx]
-
-            if min_start_dist < min_end_dist:
-                best_idx = min_start_idx
-                path_to_add = remaining.pop(best_idx)
-            else:
-                best_idx = min_end_idx
-                path_to_add = remaining.pop(best_idx)
-                path_to_add = path_to_add[::-1]  # Reverse path
-
-            ordered.append(path_to_add)
-            current_pos = path_to_add[-1]
-
-        self.ordered_paths = ordered
-        return ordered
+        return self.ordered_paths
 
     def stream_data(self):
         for path in self.ordered_paths:
@@ -307,7 +331,6 @@ class XArmArtist:
         print("Drawing complete.")
 
 
-
 class RemoteController:
     """
     A wrapper class for the configurations to run the XArmArtist and the image processing
@@ -317,7 +340,7 @@ class RemoteController:
 
         self.ROBOT_ORIGIN_X = 250
         self.ROBOT_ORIGIN_Y = -100
-        self.DRAW_WIDTH_MM = 150
+        self.DRAW_WIDTH_MM = 400
 
         self.GRIPPER_DEPTH = 74.4
         self.PEN_LENGTH = 128.4
@@ -366,7 +389,7 @@ class RemoteController:
             return
 
         print("Running Simulation...")
-        ink_x, ink_y = [], []
+        ink_x, ink_y = [],[]
         travel_x, travel_y = [],[]
         last_x, last_y = 0, 0
 
