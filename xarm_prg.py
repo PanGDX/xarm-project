@@ -39,12 +39,12 @@ def select_file_via_explorer():
     return file_path
 
 class PathPlanner:
-    def __init__(self, image_path, canvas_width_mm=400):
+    def __init__(self, image_path, canvas_width_mm=120):
         self.image_path = image_path
         self.target_width = canvas_width_mm
         self.scale_factor = 1.0
         self.origin_offset = (0, 0)
-        self.ordered_paths =[]
+        self.ordered_paths = []
 
     def display_step(self, img, title="Debug Step", save=False):
         """Helper to visualize image processing steps using Matplotlib and optionally save them."""
@@ -149,7 +149,7 @@ class PathPlanner:
             component_pixels_dict[lbl].add((y, x))
 
         min_path_length = 15 # Reject components with less than 15 pixels
-        paths =[]
+        paths = []
         debug_contours_canvas = np.zeros_like(img)
 
         print(f"Found {num_labels - 1} connected components. Running DFS to generate paths...")
@@ -165,7 +165,7 @@ class PathPlanner:
             start_node = None
             for node in component_pixels:
                 r, c = node
-                neighbors =[(r-1, c-1), (r-1, c), (r-1, c+1), 
+                neighbors = [(r-1, c-1), (r-1, c), (r-1, c+1), 
                              (r, c-1),             (r, c+1), 
                              (r+1, c-1), (r+1, c), (r+1, c+1)]
                 count = sum(1 for n in neighbors if n in component_pixels)
@@ -180,7 +180,7 @@ class PathPlanner:
             # Iterative DFS with Backtracking to generate a single continuous path
             stack = [start_node]
             visited = {start_node}
-            path =[]
+            path = []
             
             while stack:
                 curr = stack[-1]
@@ -189,12 +189,12 @@ class PathPlanner:
                     path.append(curr)
                     
                 r, c = curr
-                neighbors =[(r-1, c-1), (r-1, c), (r-1, c+1), 
+                neighbors = [(r-1, c-1), (r-1, c), (r-1, c+1), 
                              (r, c-1),             (r, c+1), 
                              (r+1, c-1), (r+1, c), (r+1, c+1)]
                              
                 # Find valid unvisited neighbors
-                unvisited_neighbors =[n for n in neighbors if n in component_pixels and n not in visited]
+                unvisited_neighbors = [n for n in neighbors if n in component_pixels and n not in visited]
                 
                 if unvisited_neighbors:
                     next_node = unvisited_neighbors[0] # Pick the first available
@@ -242,7 +242,7 @@ class PathPlanner:
         CCA already guarantees the order from Biggest to Smallest.
         """
         if not paths:
-            return[]
+            return []
 
         print("Using size-ordered paths from Connected Components (Biggest to Smallest)...")
         
@@ -338,9 +338,14 @@ class RemoteController:
     def __init__(self, image_file=None):
         self.ROBOT_IP = "192.168.1.227"
 
-        self.ROBOT_ORIGIN_X = 250
-        self.ROBOT_ORIGIN_Y = -100
-        self.DRAW_WIDTH_MM = 400
+        # --- CORRECTED PAPER BOUNDS & ORIGINS ---
+        # The paper bound is X: [185, 400] and Y: [-100, 75]
+        # Max Paper Width = 215mm | Max Paper Height = 175mm
+        
+        self.ROBOT_ORIGIN_X = 220  # Start around 220 so drawing goes left-to-right safely inside bounds
+        self.ROBOT_ORIGIN_Y = -90  # Start around -90 to use the full -100 to 75 range
+        self.DRAW_WIDTH_MM = 120   # Changed from 400. A 120mm width ensures a portrait height is roughly ~160mm. 
+                                   # Drawing will cleanly sit between X=(220 to 340) and Y=(-90 to 70)
 
         self.GRIPPER_DEPTH = 74.4
         self.PEN_LENGTH = 128.4
@@ -389,27 +394,43 @@ class RemoteController:
             return
 
         print("Running Simulation...")
-        ink_x, ink_y = [],[]
-        travel_x, travel_y = [],[]
-        last_x, last_y = 0, 0
+        ink_x, ink_y = [], []
+        travel_x, travel_y = [], []
+        last_x, last_y = None, None
 
-        for cmd, x, y in self.stream:
+        for cmd, local_x, local_y in self.stream:
+            # Apply origin offsets so simulation matches REAL robot coordinates
+            target_x = self.ROBOT_ORIGIN_X + local_x
+            target_y = self.ROBOT_ORIGIN_Y + local_y
+
+            if last_x is None:
+                last_x, last_y = target_x, target_y
+
             if cmd == 0:
-                travel_x.extend([last_x, x, np.nan])
-                travel_y.extend([last_y, y, np.nan])
+                travel_x.extend([last_x, target_x, np.nan])
+                travel_y.extend([last_y, target_y, np.nan])
                 ink_x.extend([np.nan])
                 ink_y.extend([np.nan])
             elif cmd == 1:
-                ink_x.extend([x])
-                ink_y.extend([y])
-            last_x, last_y = x, y
+                ink_x.extend([target_x])
+                ink_y.extend([target_y])
+            last_x, last_y = target_x, target_y
 
         plt.figure(figsize=(10, 10))
-        plt.title(f"Simulation: {self.IMAGE_FILE}")
-        plt.plot(travel_x, travel_y, 'r:', linewidth=0.3, alpha=0.3)
-        plt.plot(ink_x, ink_y, 'k-', linewidth=0.8)  # Black ink
+        plt.title(f"Simulation in Real Robot Space: {self.IMAGE_FILE}")
+        
+        # --- DRAW THE BOUNDING BOX OF THE PAPER ---
+        paper_x = [185, 400, 400, 185, 185]
+        paper_y = [-100, -100, 75, 75, -100]
+        plt.plot(paper_x, paper_y, 'g-', linewidth=2, label="Paper Boundary")
+
+        plt.plot(travel_x, travel_y, 'r:', linewidth=0.3, alpha=0.3, label="Travel")
+        plt.plot(ink_x, ink_y, 'k-', linewidth=0.8, label="Ink")
         plt.axis('equal')
         plt.gca().invert_yaxis()
+        plt.xlabel("Robot Base X Coordinate (mm)")
+        plt.ylabel("Robot Base Y Coordinate (mm)")
+        plt.legend()
         plt.show()
 
     def run_robot_drawing(self):
@@ -430,14 +451,14 @@ class RemoteController:
         print(time.time() - start)
 
 
-if __name__ == "__main__":
+if __name__ == "__main__":  
     remote = RemoteController()
 
     while True:
         print("\n=== xArm Artist Control Menu ===")
         print("0. Select image via File Explorer (USB/Phone)")
         print("1. Load new image (Enter path manually)")
-        print("2. Run simulation")
+        print("2. Run simulation (Now shows paper boundaries!)")
         print("3. Run robot drawing")
         print("4. Exit")
         
