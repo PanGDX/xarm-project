@@ -2,7 +2,6 @@ import os
 import cv2
 import numpy as np
 import time
-from scipy.spatial import distance
 import matplotlib.pyplot as plt
 from xarm.wrapper import XArmAPI
 from datetime import datetime
@@ -13,15 +12,9 @@ from tkinter import filedialog
 from collections import defaultdict
 
 def select_file_via_explorer():
-    """
-    Opens a standard Windows file explorer dialog to select an image file.
-    Works perfectly for USB drives or phones connected via USB (MTP).
-    """
-    # Create a dummy Tkinter root window and hide it
+    """Opens a standard Windows file explorer dialog to select an image file."""
     root = tk.Tk()
     root.withdraw()
-    
-    # Force the window to appear on top
     root.attributes('-topmost', True)
 
     print("Opening file explorer...")
@@ -32,115 +25,79 @@ def select_file_via_explorer():
             ("All Files", "*.*")
         ]
     )
-    
-    # Destroy the dummy window after selection
     root.destroy()
-    
     return file_path
 
 class PathPlanner:
-    def __init__(self, image_path, canvas_width_mm=120):
+    def __init__(self, image_path):
         self.image_path = image_path
-        self.target_width = canvas_width_mm
-        self.scale_factor = 1.0
-        self.origin_offset = (0, 0)
+        self.img_w = 0
+        self.img_h = 0
         self.ordered_paths = []
 
     def display_step(self, img, title="Debug Step", save=False):
         """Helper to visualize image processing steps using Matplotlib and optionally save them."""
-        # --- NEW SAVING LOGIC ---
         if save:
-            # Create an 'output' folder if it doesn't exist
             os.makedirs("output", exist_ok=True)
-
-            # Strip special characters from the title to make a safe filename
             safe_title = "".join([c for c in title if c.isalnum() or c == ' ']).rstrip()
-            
             image_file_name = Path(self.image_path).name
-            
             now = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
             filename = f"output/{image_file_name} {safe_title.replace(' ', '_').lower() + ' ' + now}.png"
 
-            # Save the raw image array cleanly using OpenCV
             cv2.imwrite(filename, img)
             print(f"[*] Saved debug image: {filename}")
 
-        # --- EXISTING DISPLAY LOGIC ---
         plt.figure(figsize=(10, 8))
         plt.title(title)
-        # Check if image is grayscale or color
         if len(img.shape) == 2:
             plt.imshow(img, cmap='gray')
         else:
             plt.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
         plt.axis('off')
-        plt.show()  # Code pauses here until window is closed
+        plt.show()  
 
     def process_portrait(self):
-        """
-        Optimized for Faces and Fine Details with Visual Debugging.
-        """
-        # 1. Load Image
+        """Optimized for Faces and Fine Details with Visual Debugging."""
         img_color = cv2.imread(self.image_path)
         if img_color is None:
             raise ValueError("Image not found")
 
-        # 2. Remove Background
-        # rembg takes a numpy array and returns a numpy array (BGRA format)
         img_nobg = remove(img_color)
-
         img = cv2.cvtColor(img_nobg, cv2.COLOR_BGRA2GRAY)
 
-        # 2. Resize maintaining aspect ratio
+        # Resize maintaining aspect ratio
         h, w = img.shape
         new_w = 800
         aspect_ratio = h / w
         new_h = int(new_w * aspect_ratio)
         img = cv2.resize(img, (new_w, new_h))
+        
+        # Save exact pixel dimensions for the Best-Fit algorithm
+        self.img_w = new_w
+        self.img_h = new_h
 
-        # --- DEBUG SHOW ---
         self.display_step(img, "1. Resized Image, removed background", save=True)
 
         clahe = cv2.createCLAHE(clipLimit=1.2, tileGridSize=(8, 8))
         img = clahe.apply(img)
 
         img = cv2.bilateralFilter(img, d=7, sigmaColor=40, sigmaSpace=40)
-        # --- DEBUG SHOW ---
         self.display_step(img, "3. Bilateral Filter (Smoothed Skin)")
 
-        binary_output = None
+        edges = cv2.Canny(img, 20, 60)
+        self.display_step(edges, "4a. Raw Canny Edges (1px wide)", save=True)
 
-        # --- METHOD A: Canny Edge Detection ---
-        lower_threshold = 20   
-        upper_threshold = 60  
-
-        edges = cv2.Canny(img, lower_threshold, upper_threshold)
-
-        # --- DEBUG SHOW ---
-        self.display_step(
-            edges, "4a. Raw Canny Edges (1px wide)", save=True)
-
-        dilated = cv2.dilate(edges, np.ones(
-            (3, 3), np.uint8), iterations=1)  # Connect gaps first
+        dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)  
         binary_output = cv2.ximgproc.thinning(dilated)
-        # --- DEBUG SHOW ---
-        self.display_step(
-            binary_output, "4b. Dilated (Thickened Lines)", save=True)
+        self.display_step(binary_output, "4b. Dilated (Thickened Lines)", save=True)
 
-
-        # =====================================================================
-        # NEW METHOD: Connected Component Analysis + Depth First Search
-        # =====================================================================
-        
-        # 1. Get 8-connectivity components and their stats
+        # Connected Component Analysis + DFS
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_output, connectivity=8)
         areas = stats[:, cv2.CC_STAT_AREA]
         
-        # 2. Sort components by area (biggest to smallest), ignoring background (label 0)
         label_area_pairs = [(label, areas[label]) for label in range(1, num_labels)]
         label_area_pairs.sort(key=lambda x: x[1], reverse=True)
         
-        # 3. Group pixels by label for fast access
         y_coords, x_coords = np.nonzero(labels)
         label_vals = labels[y_coords, x_coords]
         
@@ -148,20 +105,18 @@ class PathPlanner:
         for y, x, lbl in zip(y_coords, x_coords, label_vals):
             component_pixels_dict[lbl].add((y, x))
 
-        min_path_length = 15 # Reject components with less than 15 pixels
+        min_path_length = 15 
         paths = []
         debug_contours_canvas = np.zeros_like(img)
 
         print(f"Found {num_labels - 1} connected components. Running DFS to generate paths...")
 
-        # 4. Iterate over sorted components
         for label, area in label_area_pairs:
             if area < min_path_length:
                 continue
                 
             component_pixels = component_pixels_dict[label]
             
-            # Find a good starting node (an endpoint with exactly 1 neighbor if possible)
             start_node = None
             for node in component_pixels:
                 r, c = node
@@ -174,17 +129,14 @@ class PathPlanner:
                     break
             
             if start_node is None:
-                # No endpoint found (e.g. a closed loop), just pick any node
                 start_node = next(iter(component_pixels))
                 
-            # Iterative DFS with Backtracking to generate a single continuous path
             stack = [start_node]
             visited = {start_node}
             path = []
             
             while stack:
                 curr = stack[-1]
-                # Add to path if it's the first node, or if we moved to a new node/backtracked
                 if not path or path[-1] != curr:
                     path.append(curr)
                     
@@ -193,23 +145,18 @@ class PathPlanner:
                              (r, c-1),             (r, c+1), 
                              (r+1, c-1), (r+1, c), (r+1, c+1)]
                              
-                # Find valid unvisited neighbors
                 unvisited_neighbors = [n for n in neighbors if n in component_pixels and n not in visited]
                 
                 if unvisited_neighbors:
-                    next_node = unvisited_neighbors[0] # Pick the first available
+                    next_node = unvisited_neighbors[0]
                     visited.add(next_node)
                     stack.append(next_node)
                 else:
-                    stack.pop() # Dead end, remove from stack
+                    stack.pop() 
                     if stack:
-                        # Emulate physical backtracking (draw back over the line)
                         path.append(stack[-1]) 
                         
-            # 5. Convert path to (x, y) coordinates
             path_xy = np.array([(c, r) for r, c in path], dtype=np.float32)
-            
-            # 6. Approximate path to reduce unnecessary points (G-code optimization)
             epsilon = 1.0
             approx = cv2.approxPolyDP(path_xy, epsilon, closed=False)
             
@@ -218,49 +165,17 @@ class PathPlanner:
                 paths.append(final_path)
                 cv2.polylines(debug_contours_canvas, [np.int32(final_path)], isClosed=False, color=255, thickness=1)
 
-        # --- DEBUG SHOW ---
-        self.display_step(debug_contours_canvas,
-                          "5. Final DFS Paths (Robot Path)", save=True)
-
-        self.scale_factor = self.target_width / new_w
+        self.display_step(debug_contours_canvas, "5. Final DFS Paths", save=True)
         print(f"Details extracted. Found {len(paths)} paths.")
-        
-        # Logging
-        image_file_name = Path(self.image_path).name
-        os.makedirs("output", exist_ok=True)
-        filename = "log.txt"
-        with open(f"{os.getcwd()}/output/{filename}", "a") as f:
-            f.write(
-                f"{image_file_name} : Found {len(paths)} paths.\n"
-            )
 
         return paths
 
     def optimize_paths(self, paths):
-        """
-        Replaced the nearest neighbor pathing algorithm.
-        CCA already guarantees the order from Biggest to Smallest.
-        """
         if not paths:
             return []
-
         print("Using size-ordered paths from Connected Components (Biggest to Smallest)...")
-        
-        # Pre-convert all paths to float arrays to avoid type errors during streaming
         self.ordered_paths = [p.astype(float) for p in paths]
-
         return self.ordered_paths
-
-    def stream_data(self):
-        for path in self.ordered_paths:
-            # Move to start (Pen Up)
-            start = path[0] * self.scale_factor
-            yield (0, start[0], start[1])
-
-            # Draw line (Pen Down)
-            for point in path:
-                pt = point * self.scale_factor
-                yield (1, pt[0], pt[1])
 
 
 class XArmArtist:
@@ -285,67 +200,47 @@ class XArmArtist:
         self.arm.move_gohome(wait=True)
 
     def put_pen_in(self):
-        # Rotates wrist to side to make inserting pen easier
-        self.arm.set_servo_angle(servo_id=5, angle=90,
-                                 is_radian=False, wait=True)
+        self.arm.set_servo_angle(servo_id=5, angle=90, is_radian=False, wait=True)
         self.arm.set_gripper_position(self.grip_width+50, wait=True)
         print(">>> PLEASE INSERT PEN NOW. You have 10 seconds. <<<")
         time.sleep(10)
-        self.arm.set_gripper_position(
-            self.grip_width-30, wait=True)  # Grip tight
+        self.arm.set_gripper_position(self.grip_width-30, wait=True)
         time.sleep(1)
 
-    def draw(self, data_stream, origin_offset_x, origin_offset_y):
+    def draw(self, data_stream):
         self.go_home()
         print("Starting drawing...")
 
-        current_state = 0  # 0 = Up, 1 = Down
-
-        # Batch optimization could go here, but point-by-point is safer for beginners
-        for cmd_type, x, y in data_stream:
-            target_x = origin_offset_x + x
-            target_y = origin_offset_y + y
-
-            if cmd_type == 0:  # TRAVEL (Pen Up)
+        current_state = 0 
+        for cmd_type, target_x, target_y in data_stream:
+            # target_x and target_y are already mapped to real physical absolute coordinates
+            if cmd_type == 0:  
                 if current_state == 1:
-                    self.arm.set_position(
-                        z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
+                    self.arm.set_position(z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
                     current_state = 0
-                self.arm.set_position(
-                    x=target_x, y=target_y, z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
+                self.arm.set_position(x=target_x, y=target_y, z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
 
-            elif cmd_type == 1:  # DRAW (Pen Down)
+            elif cmd_type == 1: 
                 if current_state == 0:
-                    self.arm.set_position(
-                        z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=True)
+                    self.arm.set_position(z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=True)
                     current_state = 1
-                # wait=False allows continuous motion (smoother curves)
-                self.arm.set_position(
-                    x=target_x, y=target_y, z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=False)
+                self.arm.set_position(x=target_x, y=target_y, z=self.z_draw, speed=self.speed, mvacc=self.acc, wait=False)
 
-        # Lift at end
-        self.arm.set_position(
-            z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
+        self.arm.set_position(z=self.z_travel, speed=self.speed, mvacc=self.acc, wait=True)
         self.go_home()
         self.arm.disconnect()
         print("Drawing complete.")
 
 
 class RemoteController:
-    """
-    A wrapper class for the configurations to run the XArmArtist and the image processing
-    """
     def __init__(self, image_file=None):
         self.ROBOT_IP = "192.168.1.227"
 
-        # --- CORRECTED PAPER BOUNDS & ORIGINS ---
-        # The paper bound is X: [185, 400] and Y: [-100, 75]
-        # Max Paper Width = 215mm | Max Paper Height = 175mm
-        
-        self.ROBOT_ORIGIN_X = 220  # Start around 220 so drawing goes left-to-right safely inside bounds
-        self.ROBOT_ORIGIN_Y = -90  # Start around -90 to use the full -100 to 75 range
-        self.DRAW_WIDTH_MM = 120   # Changed from 400. A 120mm width ensures a portrait height is roughly ~160mm. 
-                                   # Drawing will cleanly sit between X=(220 to 340) and Y=(-90 to 70)
+        # Hard bounds of the physical paper
+        self.PAPER_MIN_X = 185
+        self.PAPER_MAX_X = 400
+        self.PAPER_MIN_Y = -100
+        self.PAPER_MAX_Y = 75
 
         self.GRIPPER_DEPTH = 74.4
         self.PEN_LENGTH = 128.4
@@ -354,39 +249,100 @@ class RemoteController:
 
         self.IMAGE_FILE = None
         self.pathplanner = None
-        self.stream = None
+        self.stream = []
 
-        # Process an initial image if provided
         if image_file:
             self.load_image(image_file)
 
     def load_image(self, image_file):
-        """Processes a new image and updates the drawing paths."""
+        """Processes image, tests orientations, and builds the safest/largest stream of robot absolute paths."""
         self.IMAGE_FILE = image_file
-        self.pathplanner = PathPlanner(self.IMAGE_FILE, canvas_width_mm=self.DRAW_WIDTH_MM)
+        self.pathplanner = PathPlanner(self.IMAGE_FILE)
         
         try:
             print(f"Processing image: {self.IMAGE_FILE}...")
             raw_paths = self.pathplanner.process_portrait()
-            self.pathplanner.optimize_paths(raw_paths)
+            ordered_paths = self.pathplanner.optimize_paths(raw_paths)
             
-            # Note: converting the generator to a list so it can be reused
-            # for both simulation and real robot drawing without needing to re-process!
-            self.stream = list(self.pathplanner.stream_data())
-            print("Image processing complete and paths saved.")
+            img_w = self.pathplanner.img_w
+            img_h = self.pathplanner.img_h
+            
+            cx_pixel = img_w / 2.0
+            cy_pixel = img_h / 2.0
+            
+            # --- CALCULATE BEST FIT (LANDSCAPE VS PORTRAIT) ---
+            margin = 10  # mm buffer so we never draw on the exact edge of the paper
+            min_x = self.PAPER_MIN_X + margin
+            max_x = self.PAPER_MAX_X - margin
+            min_y = self.PAPER_MIN_Y + margin
+            max_y = self.PAPER_MAX_Y - margin
+            
+            avail_x = max_x - min_x  # Robot Depth
+            avail_y = max_y - min_y  # Robot Lateral
+            
+            paper_cx = (max_x + min_x) / 2.0
+            paper_cy = (max_y + min_y) / 2.0
+            
+            # Test 1: Upright mapping
+            scale1_x = avail_x / img_h
+            scale1_y = avail_y / img_w
+            scale1 = min(scale1_x, scale1_y)
+            
+            # Test 2: Rotated 90 degrees mapping
+            scale2_x = avail_x / img_w
+            scale2_y = avail_y / img_h
+            scale2 = min(scale2_x, scale2_y)
+            
+            if scale1 >= scale2:
+                chosen_scale = scale1
+                is_rotated = False
+                print(f"[*] Orientation: Upright Portrait (Scale Factor: {chosen_scale:.4f})")
+            else:
+                chosen_scale = scale2
+                is_rotated = True
+                print(f"[*] Orientation: Rotated 90 Deg. for Best Fit (Scale Factor: {chosen_scale:.4f})")
+                
+            # Build physical stream
+            self.stream = []
+            for path in ordered_paths:
+                if len(path) == 0: continue
+                
+                # Travel (Pen Up)
+                pt_start = self._transform_point(path[0][0], path[0][1], cx_pixel, cy_pixel, paper_cx, paper_cy, chosen_scale, is_rotated)
+                self.stream.append((0, pt_start[0], pt_start[1]))
+                
+                # Draw (Pen Down)
+                for point in path:
+                    pt = self._transform_point(point[0], point[1], cx_pixel, cy_pixel, paper_cx, paper_cy, chosen_scale, is_rotated)
+                    self.stream.append((1, pt[0], pt[1]))
+                    
+            print("Image coordinates scaled and translated to Robot boundaries safely.")
+            
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"Error processing image: {e}")
-            self.stream = None
+            self.stream = []
 
-    def change_robot_config(self, **kwargs):
-        self.ROBOT_ORIGIN_X = kwargs.get("ROBOT_ORIGIN_X", self.ROBOT_ORIGIN_X)
-        self.ROBOT_ORIGIN_Y = kwargs.get("ROBOT_ORIGIN_Y", self.ROBOT_ORIGIN_Y)
-        self.DRAW_WIDTH_MM = kwargs.get("DRAW_WIDTH_MM", self.DRAW_WIDTH_MM)
-
-        self.GRIPPER_DEPTH = kwargs.get("GRIPPER_DEPTH", self.GRIPPER_DEPTH)
-        self.PEN_LENGTH = kwargs.get("PEN_LENGTH", self.PEN_LENGTH)
-        self.PEN_DOWN_Z = self.PEN_LENGTH - self.GRIPPER_DEPTH
-        self.PEN_UP_Z = self.PEN_DOWN_Z + 15
+    def _transform_point(self, px, py, cx_pixel, cy_pixel, paper_cx, paper_cy, scale, is_rotated):
+        """Translates pixel data into properly scaled physical robot data taking orientation into account."""
+        px_centered = px - cx_pixel
+        py_centered = py - cy_pixel
+        
+        if not is_rotated:
+            # Upright: Image Y->Robot X (Depth), Image X->Robot Y (Lateral)
+            robot_x = paper_cx - (py_centered * scale)
+            robot_y = paper_cy - (px_centered * scale)
+        else:
+            # Rotated: Image X->Robot X (Depth), Image Y->Robot Y (Lateral)
+            robot_x = paper_cx + (px_centered * scale)
+            robot_y = paper_cy - (py_centered * scale)
+            
+        # Hard cap to bounds (Safety Fallback)
+        robot_x = max(self.PAPER_MIN_X, min(self.PAPER_MAX_X, robot_x))
+        robot_y = max(self.PAPER_MIN_Y, min(self.PAPER_MAX_Y, robot_y))
+        
+        return (robot_x, robot_y)
 
     def run_simulation(self):
         if not self.stream:
@@ -396,41 +352,47 @@ class RemoteController:
         print("Running Simulation...")
         ink_x, ink_y = [], []
         travel_x, travel_y = [], []
-        last_x, last_y = None, None
+        last_vis_x, last_vis_y = None, None
 
-        for cmd, local_x, local_y in self.stream:
-            # Apply origin offsets so simulation matches REAL robot coordinates
-            target_x = self.ROBOT_ORIGIN_X + local_x
-            target_y = self.ROBOT_ORIGIN_Y + local_y
+        for cmd, target_x, target_y in self.stream:
+            # Matplotlib X mapped to Robot Y (Left/Right)
+            # Matplotlib Y mapped to Robot X (Depth)
+            vis_x = target_y  
+            vis_y = target_x  
 
-            if last_x is None:
-                last_x, last_y = target_x, target_y
+            if last_vis_x is None:
+                last_vis_x, last_vis_y = vis_x, vis_y
 
             if cmd == 0:
-                travel_x.extend([last_x, target_x, np.nan])
-                travel_y.extend([last_y, target_y, np.nan])
+                travel_x.extend([last_vis_x, vis_x, np.nan])
+                travel_y.extend([last_vis_y, vis_y, np.nan])
                 ink_x.extend([np.nan])
                 ink_y.extend([np.nan])
             elif cmd == 1:
-                ink_x.extend([target_x])
-                ink_y.extend([target_y])
-            last_x, last_y = target_x, target_y
+                ink_x.extend([vis_x])
+                ink_y.extend([vis_y])
+            last_vis_x, last_vis_y = vis_x, vis_y
 
-        plt.figure(figsize=(10, 10))
-        plt.title(f"Simulation in Real Robot Space: {self.IMAGE_FILE}")
+        plt.figure(figsize=(7, 9))
+        plt.title(f"Desk View Perspective: {self.IMAGE_FILE}")
         
-        # --- DRAW THE BOUNDING BOX OF THE PAPER ---
-        paper_x = [185, 400, 400, 185, 185]
-        paper_y = [-100, -100, 75, 75, -100]
-        plt.plot(paper_x, paper_y, 'g-', linewidth=2, label="Paper Boundary")
+        # Paper Bounding Box mapped to visual view
+        paper_vis_x = [self.PAPER_MIN_Y, self.PAPER_MAX_Y, self.PAPER_MAX_Y, self.PAPER_MIN_Y, self.PAPER_MIN_Y]
+        paper_vis_y = [self.PAPER_MIN_X, self.PAPER_MIN_X, self.PAPER_MAX_X, self.PAPER_MAX_X, self.PAPER_MIN_X]
+        plt.plot(paper_vis_x, paper_vis_y, 'g-', linewidth=2, label="Paper Edge Limit")
 
-        plt.plot(travel_x, travel_y, 'r:', linewidth=0.3, alpha=0.3, label="Travel")
-        plt.plot(ink_x, ink_y, 'k-', linewidth=0.8, label="Ink")
+        plt.plot(travel_x, travel_y, 'r:', linewidth=0.3, alpha=0.3, label="Robot Travel")
+        plt.plot(ink_x, ink_y, 'k-', linewidth=0.8, label="Pen Ink")
+        
         plt.axis('equal')
-        plt.gca().invert_yaxis()
-        plt.xlabel("Robot Base X Coordinate (mm)")
-        plt.ylabel("Robot Base Y Coordinate (mm)")
-        plt.legend()
+        
+        # Invert Matplotlib's X-Axis because robot's positive Y goes left
+        # (This correctly fakes standing behind the robot arm looking at the desk)
+        plt.gca().invert_xaxis() 
+        
+        plt.xlabel("Robot Base Y (mm) [Negative is Right, Positive is Left]")
+        plt.ylabel("Robot Base X (mm) [Closer to Base <---> Farther Away]")
+        plt.legend(loc="upper right")
         plt.show()
 
     def run_robot_drawing(self):
@@ -439,16 +401,13 @@ class RemoteController:
             return
 
         print("Running on Real xArm...")
-        import time
-
         start = time.time()
         bot = XArmArtist(self.ROBOT_IP, speed=300, acceleration=1000,
                          z_draw=self.PEN_DOWN_Z, z_travel=self.PEN_UP_Z, grip_width=270)
         bot.connect()
         bot.put_pen_in()
-        bot.draw(self.stream, self.ROBOT_ORIGIN_X, self.ROBOT_ORIGIN_Y)
-        print("Time Taken:")
-        print(time.time() - start)
+        bot.draw(self.stream) # No offsets needed, they are already pre-calculated!
+        print(f"Time Taken: {time.time() - start:.2f} seconds")
 
 
 if __name__ == "__main__":  
@@ -458,7 +417,7 @@ if __name__ == "__main__":
         print("\n=== xArm Artist Control Menu ===")
         print("0. Select image via File Explorer (USB/Phone)")
         print("1. Load new image (Enter path manually)")
-        print("2. Run simulation (Now shows paper boundaries!)")
+        print("2. Run simulation (Accurate Desk Perspective!)")
         print("3. Run robot drawing")
         print("4. Exit")
         
